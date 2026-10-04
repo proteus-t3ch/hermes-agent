@@ -2457,7 +2457,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
     mappings.
+
+    Agents built for a strict model run (``agent._strict_runtime is True``,
+    set by the API server for ``POST /v1/runs {"strict_model": true}``)
+    never switch: the caller demanded an exact provider+model, so a failure
+    on that runtime must fail the turn instead of silently running on a
+    different backend.
     """
+    if getattr(agent, "_strict_runtime", False) is True:
+        logger.warning(
+            "Fallback refused: strict model run pinned to %s via %s (%s)",
+            getattr(agent, "model", "") or "<unknown>",
+            getattr(agent, "provider", "") or "<unknown>",
+            _fallback_reason_text(reason),
+        )
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

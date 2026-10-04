@@ -1477,6 +1477,97 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+class _StrictModelViolation(RuntimeError):
+    """A strict model run (``strict_model: true``) could not be honoured.
+
+    Raised by ``_create_agent`` when something other than the client's exact
+    provider+model would execute the run: a ``model_routes`` alias, a session
+    ``/model`` override, a session-persisted model, a Browser model lock, or a
+    provider runtime that resolves to a different provider.  The run fails
+    instead of silently executing on another runtime.
+    """
+
+
+# Bounds for the client ``metadata`` echo on /v1/runs status.  Only string
+# values are kept; everything else is dropped silently (metadata is
+# informational and must never fail a non-strict request).
+_RUN_METADATA_MAX_KEYS = 16
+_RUN_METADATA_MAX_KEY_LEN = 64
+_RUN_METADATA_MAX_VALUE_LEN = 256
+# Metadata keys that are included in the server log line for a run.
+_RUN_METADATA_LOG_KEYS = ("execution_id", "correlation_id", "kind")
+
+
+def _sanitize_run_metadata(raw: Any) -> Dict[str, str]:
+    """Return a bounded ``{str: str}`` copy of client run metadata."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: Dict[str, str] = {}
+    for key, value in raw.items():
+        if len(cleaned) >= _RUN_METADATA_MAX_KEYS:
+            break
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key = key.strip()
+        if not key or len(key) > _RUN_METADATA_MAX_KEY_LEN:
+            continue
+        if re.search(r"[\r\n\x00]", key) or re.search(r"[\r\n\x00]", value):
+            continue
+        cleaned[key] = value[:_RUN_METADATA_MAX_VALUE_LEN]
+    return cleaned
+
+
+def _parse_strict_model_request(body: Any) -> tuple:
+    """Validate ``strict_model`` on a /v1/runs body.
+
+    Returns ``(strict, error_message)``.  ``strict_model`` absent or ``null``
+    means a normal (non-strict) run.  When ``true`` the body must carry a
+    non-empty ``provider`` and ``model``; ``provider: "auto"`` is rejected
+    because it delegates the provider choice to the server.
+    """
+    if not isinstance(body, dict):
+        return False, None
+    raw = body.get("strict_model")
+    if raw is None:
+        return False, None
+    if not isinstance(raw, bool):
+        return False, "'strict_model' must be a boolean"
+    if not raw:
+        return False, None
+    provider = _clean_request_string(body.get("provider"))
+    model = _clean_request_string(body.get("model"))
+    if not provider or not model:
+        return True, "'strict_model' requires non-empty 'provider' and 'model'"
+    if provider.lower() == "auto":
+        return True, "'strict_model' requires an explicit provider, not 'auto'"
+    return True, None
+
+
+def _normalize_provider_id(provider: Any) -> str:
+    """Canonical provider id for strict-run comparisons (aliases folded)."""
+    if not isinstance(provider, str) or not provider.strip():
+        return ""
+    try:
+        from hermes_cli.providers import normalize_provider
+
+        return normalize_provider(provider)
+    except Exception:
+        return provider.strip().lower()
+
+
+def _strict_provider_matches(requested: Any, actual: Any) -> bool:
+    """True when *actual* is the provider the strict run asked for."""
+    want = _normalize_provider_id(requested)
+    got = _normalize_provider_id(actual)
+    if not want or not got:
+        return False
+    if want == got:
+        return True
+    # Named custom providers ("custom:<name>") may resolve with a bare
+    # "custom" provider id; that is still the requested endpoint.
+    return want.startswith("custom:") and got == "custom"
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -2811,6 +2902,128 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    def _strict_run_conflict_error(
+        self,
+        *,
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+        requested_model: Optional[str],
+        route: Optional[Dict[str, Any]],
+    ) -> Optional[tuple]:
+        """Return ``(http_status, message)`` when a strict run cannot be honoured.
+
+        Strict runs reject — never apply — any server-side selection that
+        would change the requested provider/model.
+        """
+        if not requested_model:
+            # The body's model was the advertised virtual alias, which means
+            # "gateway default" — not an exact model.
+            return (
+                400,
+                f"'strict_model' requires a concrete model id; '{self._model_name}' "
+                "is the gateway default alias",
+            )
+        if route is not None:
+            return (
+                409,
+                f"'model' {requested_model!r} matches a model_routes alias; "
+                "strict runs cannot be re-routed",
+            )
+        if self._session_model_override_for(gateway_session_key or session_id):
+            return (
+                409,
+                "session has a /model override; strict runs cannot use a "
+                "session-overridden model",
+            )
+        return None
+
+    async def _strict_provider_precheck(
+        self, provider: Optional[str], model: Optional[str]
+    ) -> Optional[str]:
+        """Resolve the strict run's provider before accepting the run.
+
+        Returns an error message when the requested provider cannot be
+        resolved (or resolves to a different provider), else ``None``.  The
+        run is resolved again in ``_create_agent``; this check only lets the
+        common misconfiguration fail synchronously instead of after 202.
+        """
+        request_profile = _api_request_profile.get()
+
+        def _resolve() -> Dict[str, Any]:
+            with self._profile_scope(request_profile):
+                try:
+                    return _resolve_request_runtime_agent_kwargs(
+                        provider or "", target_model=model or None
+                    )
+                except Exception:
+                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+                    return _resolve_runtime_agent_kwargs_for_provider(provider or "")
+
+        try:
+            runtime = await asyncio.get_running_loop().run_in_executor(None, _resolve)
+        except Exception as exc:
+            return (
+                f"strict model run: provider {provider!r} cannot be resolved: "
+                f"{_redact_api_error_text(exc)}"
+            )
+        resolved = runtime.get("provider") if isinstance(runtime, dict) else None
+        if not _strict_provider_matches(provider, resolved):
+            return (
+                f"strict model run: provider {provider!r} resolved to "
+                f"{resolved or '<none>'!r}"
+            )
+        return None
+
+    @classmethod
+    def _effective_runtime_fields(cls, agent: Any) -> Dict[str, Any]:
+        """Runtime that actually executed a run, read from the agent itself.
+
+        Returns ``{}`` when no agent was built (e.g. provider resolution
+        failed).  Values are read from the agent AFTER the run so a mid-run
+        fallback switch is reported — never the request echo.
+        """
+        if agent is None:
+            return {}
+        fields: Dict[str, Any] = {}
+        raw_provider = getattr(agent, "provider", None)
+        raw_model = getattr(agent, "model", None)
+        provider = cls._clean_runtime_id(raw_provider, max_len=80) if isinstance(raw_provider, str) else ""
+        model = cls._clean_runtime_id(raw_model) if isinstance(raw_model, str) else ""
+        if provider:
+            fields["effective_provider"] = provider
+        if model:
+            fields["effective_model"] = model
+        # ``is True`` guards: MagicMock agents in tests auto-create truthy attrs.
+        fallback = (
+            getattr(agent, "_fallback_activated", False) is True
+            or getattr(agent, "_provider_fallback_active", False) is True
+        )
+        primary = getattr(agent, "_primary_runtime", None)
+        if not fallback and isinstance(primary, dict):
+            primary_provider = primary.get("provider")
+            primary_model = primary.get("model")
+            if (
+                isinstance(primary_provider, str) and primary_provider and provider
+                and primary_provider != provider
+            ) or (
+                isinstance(primary_model, str) and primary_model and model
+                and primary_model != model
+            ):
+                fallback = True
+        fields["fallback_activated"] = fallback
+        return fields
+
+    @staticmethod
+    def _run_metadata_log_fields(metadata: Dict[str, str]) -> str:
+        """``key=value`` pairs for the run log line (ids only, no content)."""
+        parts = []
+        for key in _RUN_METADATA_LOG_KEYS:
+            value = metadata.get(key) if isinstance(metadata, dict) else None
+            value = value[:128] if isinstance(value, str) and value else "-"
+            parts.append(f"{key}={value}")
+        return " ".join(parts)
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -2826,6 +3039,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        strict_model: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2859,6 +3073,16 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        ``strict_model`` (``POST /v1/runs {"strict_model": true}``) demands
+        that exactly ``requested_provider`` + ``requested_model`` execute the
+        run.  The global primary provider is never resolved (so its auth
+        failure cannot detour through the fallback chain), the requested
+        provider is resolved with ``required=True``, any route / session
+        override / session model / Browser lock raises
+        ``_StrictModelViolation`` instead of being applied, no fallback chain
+        is handed to the agent, and the agent is flagged ``_strict_runtime``
+        so ``try_activate_fallback`` refuses mid-run swaps.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2879,11 +3103,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # _ProviderAuthResolutionError lets _run_agent() (and
         # _handle_runs()) distinguish this from an unrelated RuntimeError
         # elsewhere in the call graph.
-        try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-        except RuntimeError as exc:
-            raise _ProviderAuthResolutionError(str(exc)) from exc
-        model = _resolve_gateway_model()
+        strict_request_model = _clean_request_string(requested_model) if strict_model else None
+        strict_request_provider = _clean_request_string(requested_provider) if strict_model else None
+        if strict_model:
+            if not strict_request_model or not strict_request_provider:
+                raise _StrictModelViolation(
+                    "strict model run requires an explicit provider and model"
+                )
+            # Never consult the global primary: its auth failure would fall
+            # through to the fallback provider chain.  The requested provider
+            # is resolved below with required=True.
+            runtime_kwargs = {}
+            model = strict_request_model
+        else:
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+            except RuntimeError as exc:
+                raise _ProviderAuthResolutionError(str(exc)) from exc
+            model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
         # cap), _resolve_runtime_agent_kwargs() falls through to the fallback
@@ -2955,12 +3192,49 @@ class APIServerAdapter(BasePlatformAdapter):
         session_override = None
         if not confirmed_runtime_lock:
             session_override = self._session_model_override_for(session_key)
+        if strict_model:
+            # Strict runs never let server-side selection state replace the
+            # client's provider+model: reject instead of applying it.
+            if confirmed_runtime_lock:
+                raise _StrictModelViolation(
+                    "strict model run conflicts with a confirmed session model lock"
+                )
+            if session_override:
+                raise _StrictModelViolation(
+                    "strict model run conflicts with a session /model override"
+                )
+            if session_row_model:
+                raise _StrictModelViolation(
+                    "strict model run conflicts with a session-persisted model"
+                )
+            if route is not None:
+                raise _StrictModelViolation(
+                    "strict model run conflicts with a model_routes alias"
+                )
+            provider_runtime = _resolve_provider_runtime(
+                strict_request_provider,
+                target_model=strict_request_model,
+                required=True,
+            )
+            resolved_provider = (provider_runtime or {}).get("provider")
+            if not provider_runtime or not _strict_provider_matches(
+                strict_request_provider, resolved_provider
+            ):
+                raise _StrictModelViolation(
+                    "strict model run: requested provider "
+                    f"{strict_request_provider!r} resolved to "
+                    f"{resolved_provider or '<none>'!r}"
+                )
+            _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            model = strict_request_model
         # Model-string precedence delegates to the shared owner
         # hermes_cli.model_switch.resolve_effective_model (session /model
         # override > session-persisted model > global) — the rule 7dd00bb47d
         # had to re-fix here after it diverged from gateway/run.py.
         from hermes_cli.model_switch import resolve_effective_model
-        if session_override:
+        if strict_model:
+            pass  # Selection fully settled above.
+        elif session_override:
             override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
@@ -3099,7 +3373,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or strict_model
             else GatewayRunner._load_fallback_model()
         )
 
@@ -3141,11 +3415,30 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if strict_model:
+            # Belt and braces: no chain to walk, and try_activate_fallback
+            # refuses outright for strict agents.
+            agent._strict_runtime = True
+            agent._fallback_chain = []
+            agent._fallback_index = 0
+            actual_provider = getattr(agent, "provider", "")
+            actual_model = getattr(agent, "model", "")
+            if not _strict_provider_matches(strict_request_provider, actual_provider) or (
+                actual_model != strict_request_model
+            ):
+                raise _StrictModelViolation(
+                    "strict model run: agent initialised on "
+                    f"provider={actual_provider or '<unknown>'!r} "
+                    f"model={actual_model or '<unknown>'!r}, expected "
+                    f"provider={strict_request_provider!r} model={strict_request_model!r}"
+                )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
             "route_source": (
-                "session_model_lock"
+                "strict_request"
+                if strict_model
+                else "session_model_lock"
                 if confirmed_runtime_lock
                 else "session_model_override"
                 if session_override
@@ -3358,6 +3651,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                # POST /v1/runs accepts {"strict_model": true} (exact
+                # provider+model, no fallback) and run status reports
+                # effective_provider / effective_model / fallback_activated.
+                "strict_model_runs": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -7665,8 +7962,43 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        strict_model, strict_error = _parse_strict_model_request(body)
+        if strict_error:
+            return web.json_response(
+                _openai_error(strict_error, code="invalid_strict_model"), status=400
+            )
+        run_metadata = _sanitize_run_metadata(body.get("metadata"))
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+        if strict_model:
+            strict_conflict = self._strict_run_conflict_error(
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                requested_model=agent_overrides.get("requested_model"),
+                route=route,
+            )
+            if strict_conflict:
+                conflict_status, conflict_msg = strict_conflict
+                return web.json_response(
+                    _openai_error(
+                        conflict_msg,
+                        code=(
+                            "invalid_strict_model"
+                            if conflict_status == 400
+                            else "strict_model_conflict"
+                        ),
+                    ),
+                    status=conflict_status,
+                )
+            strict_unavailable = await self._strict_provider_precheck(
+                agent_overrides.get("requested_provider"),
+                agent_overrides.get("requested_model"),
+            )
+            if strict_unavailable:
+                return web.json_response(
+                    _openai_error(strict_unavailable, code="strict_model_unavailable"),
+                    status=409,
+                )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -7716,13 +8048,46 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # ``model`` is kept for backward compatibility but only echoes the
+        # request; ``effective_model`` / ``effective_provider`` (set when the
+        # run reaches a terminal state) report the runtime that executed.
         self._set_run_status(
             run_id,
             "queued",
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            requested_model=_clean_request_string(body.get("model")),
+            requested_provider=_clean_request_string(body.get("provider")),
+            strict_model=strict_model,
+            metadata=run_metadata,
         )
+        logger.info(
+            "[api_server] run %s queued strict_model=%s requested_provider=%s "
+            "requested_model=%s %s",
+            run_id,
+            strict_model,
+            self._clean_runtime_id(body.get("provider"), max_len=80) or "-",
+            self._clean_runtime_id(body.get("model")) or "-",
+            self._run_metadata_log_fields(run_metadata),
+        )
+        run_agent_ref: List[Any] = [None]
+
+        def _finish_runtime_fields(status: str) -> Dict[str, Any]:
+            """Effective runtime fields for a terminal status, logged once."""
+            fields = self._effective_runtime_fields(run_agent_ref[0])
+            logger.info(
+                "[api_server] run %s %s strict_model=%s effective_provider=%s "
+                "effective_model=%s fallback_activated=%s %s",
+                run_id,
+                status,
+                strict_model,
+                fields.get("effective_provider", "-"),
+                fields.get("effective_model", "-"),
+                fields.get("fallback_activated", "-"),
+                self._run_metadata_log_fields(run_metadata),
+            )
+            return fields
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
@@ -7749,6 +8114,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                create_kwargs: Dict[str, Any] = {}
+                if strict_model:
+                    create_kwargs["strict_model"] = True
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -7760,7 +8128,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        **create_kwargs,
                     )
+                run_agent_ref[0] = agent
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -7866,6 +8236,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                             "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                         }
+                        est_cost = getattr(agent, "session_estimated_cost_usd", None)
+                        if isinstance(est_cost, (int, float)) and not isinstance(est_cost, bool):
+                            u["estimated_cost_usd"] = float(est_cost)
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
@@ -7879,6 +8252,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        **_finish_runtime_fields("cancelled"),
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -7896,6 +8270,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
+                        **_finish_runtime_fields("failed"),
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -7903,12 +8278,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
                     pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                    runtime_fields = _finish_runtime_fields("completed")
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
+                        **runtime_fields,
                     }
                     if pending_steer:
                         completed_event["pending_steer"] = pending_steer
@@ -7919,6 +8296,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                        **runtime_fields,
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
             except asyncio.CancelledError:
@@ -7926,6 +8304,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
+                    **_finish_runtime_fields("cancelled"),
                 )
                 try:
                     _put_event_if_active({
@@ -7951,6 +8330,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed",
                     error=error_msg,
                     last_event="run.failed",
+                    **_finish_runtime_fields("failed"),
                 )
                 try:
                     _put_event_if_active({
@@ -7968,6 +8348,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed",
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
+                    **_finish_runtime_fields("failed"),
                 )
                 try:
                     _put_event_if_active({
