@@ -1555,6 +1555,32 @@ def _normalize_provider_id(provider: Any) -> str:
         return provider.strip().lower()
 
 
+_OFFICIAL_STRICT_HOSTS = {"anthropic": "api.anthropic.com"}
+
+
+def _strict_endpoint_allowed(provider: Any, base_url: Any) -> bool:
+    """Strict runs on ``anthropic`` must reach the official API, not a proxy.
+
+    A proxy (LiteLLM and friends) can run its own fallback behind a matching
+    provider id.  Empty/default base_url is the official endpoint.  Other
+    providers are not constrained here (documented limitation).
+    """
+    prov = _normalize_provider_id(provider) if provider else ""
+    host = _OFFICIAL_STRICT_HOSTS.get(prov)
+    if host is None:
+        return True
+    url = str(base_url or "").strip()
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() == host
+
+
 def _strict_provider_matches(requested: Any, actual: Any) -> bool:
     """True when *actual* is the provider the strict run asked for."""
     want = _normalize_provider_id(requested)
@@ -2973,6 +2999,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 f"strict model run: provider {provider!r} resolved to "
                 f"{resolved or '<none>'!r}"
             )
+        base_url = runtime.get("base_url") if isinstance(runtime, dict) else ""
+        if not _strict_endpoint_allowed(resolved, base_url):
+            return (
+                f"strict model run: provider {provider!r} is configured with a "
+                "non-official endpoint (a proxy may apply its own fallback)"
+            )
         return None
 
     @classmethod
@@ -3012,6 +3044,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 fallback = True
         fields["fallback_activated"] = fallback
+        used = getattr(agent, "_aux_models_used", None)
+        if getattr(agent, "_strict_runtime", False) is True and isinstance(used, list):
+            fields["aux_models_used"] = [
+                {"provider": str(e.get("provider", "")), "model": str(e.get("model", ""))}
+                for e in used if isinstance(e, dict)
+            ]
         return fields
 
     @staticmethod
@@ -3413,9 +3451,18 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        if strict_model:
+            # A background review forks its own agent on the auxiliary
+            # provider chain; a strict run must not.
+            agent_kwargs["skip_background_review"] = True
 
         agent = AIAgent(**agent_kwargs)
         if strict_model:
+            # Compression summarises through the auxiliary client, whose
+            # provider chain can leave the pin.  Off: an over-long strict run
+            # fails at the provider instead of being summarised elsewhere.
+            agent.compression_enabled = False
+            agent._aux_models_used = []
             # Belt and braces: no chain to walk, and try_activate_fallback
             # refuses outright for strict agents.
             agent._strict_runtime = True
@@ -3423,6 +3470,11 @@ class APIServerAdapter(BasePlatformAdapter):
             agent._fallback_index = 0
             actual_provider = getattr(agent, "provider", "")
             actual_model = getattr(agent, "model", "")
+            if not _strict_endpoint_allowed(actual_provider, getattr(agent, "base_url", "")):
+                raise _StrictModelViolation(
+                    "strict model run: provider endpoint is not the official API "
+                    f"for {actual_provider!r}"
+                )
             if not _strict_provider_matches(strict_request_provider, actual_provider) or (
                 actual_model != strict_request_model
             ):
@@ -8206,11 +8258,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            strict_aux_token = None
+                            if getattr(agent, "_strict_runtime", False) is True:
+                                from agent.auxiliary_client import enter_strict_aux_scope
+
+                                strict_aux_token = enter_strict_aux_scope(agent)
+                            try:
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
+                            finally:
+                                if strict_aux_token is not None:
+                                    from agent.auxiliary_client import exit_strict_aux_scope
+
+                                    exit_strict_aux_scope(strict_aux_token)
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
@@ -8394,8 +8457,15 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
+        accepted: Dict[str, Any] = {"run_id": run_id, "status": "started"}
+        if strict_model:
+            # The run-binding acknowledgement: what THIS run accepted.  A client
+            # that gets no echo is talking to a server that ignored strict_model.
+            accepted["strict_model"] = True
+            accepted["requested_provider"] = agent_overrides.get("requested_provider")
+            accepted["requested_model"] = agent_overrides.get("requested_model")
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            accepted,
             status=202,
             headers=response_headers,
         )

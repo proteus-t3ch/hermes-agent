@@ -48,7 +48,8 @@ STRICT_BODY = {
 ANTHROPIC_RUNTIME = {
     "provider": "anthropic",
     "api_key": "sk-test-anthropic",
-    "base_url": "https://anthropic.example",
+    # The official endpoint: strict anthropic runs refuse proxies (v2).
+    "base_url": "https://api.anthropic.com",
     "api_mode": "anthropic_messages",
 }
 
@@ -572,3 +573,205 @@ def test_try_activate_fallback_refuses_for_strict_agent():
     assert agent.model == "claude-haiku-4-5-20251001"
     assert agent._fallback_index == 0
     assert agent._fallback_activated is False
+
+
+# ---------------------------------------------------------------------------
+# v2 — run-binding 202 echo, no auxiliary calls, official endpoint only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strict_202_echoes_the_accepted_request(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: dict(ANTHROPIC_RUNTIME),
+    )
+    adapter = _make_adapter()
+    agent = _RanAgent("anthropic", "claude-haiku-4-5-20251001")
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            resp = await cli.post("/v1/runs", json=STRICT_BODY)
+            data = await resp.json()
+            await _wait_terminal(cli, data["run_id"])
+    assert resp.status == 202
+    assert data["strict_model"] is True
+    assert data["requested_provider"] == "anthropic"
+    assert data["requested_model"] == "claude-haiku-4-5-20251001"
+
+
+@pytest.mark.asyncio
+async def test_non_strict_202_carries_no_echo():
+    adapter = _make_adapter()
+    agent = _RanAgent("nous", "z-ai/glm-5.2")
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            resp = await cli.post("/v1/runs", json={"input": "hi"})
+            data = await resp.json()
+            await _wait_terminal(cli, data["run_id"])
+    assert resp.status == 202
+    assert "strict_model" not in data
+    assert "requested_model" not in data
+
+
+@pytest.mark.asyncio
+async def test_strict_refuses_a_proxy_endpoint_before_202(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: {**ANTHROPIC_RUNTIME, "base_url": "https://litellm.internal/v1"},
+    )
+    adapter = _make_adapter()
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        with patch.object(adapter, "_create_agent") as mock_create:
+            resp = await cli.post("/v1/runs", json=STRICT_BODY)
+            data = await resp.json()
+    assert resp.status == 409
+    assert data["error"]["code"] == "strict_model_unavailable"
+    mock_create.assert_not_called()
+
+
+@pytest.mark.parametrize("url,ok", [
+    ("", True),
+    ("https://api.anthropic.com", True),
+    ("https://api.anthropic.com/v1/", True),
+    ("http://api.anthropic.com", False),
+    ("https://api.anthropic.com.attacker.test", False),
+    ("https://litellm.internal/v1", False),
+])
+def test_strict_endpoint_allowed(url, ok):
+    from gateway.platforms.api_server import _strict_endpoint_allowed
+
+    assert _strict_endpoint_allowed("anthropic", url) is ok
+    # Other providers are not constrained (documented limitation).
+    assert _strict_endpoint_allowed("openrouter", "https://anything.example") is True
+
+
+def test_create_agent_strict_disables_background_review_and_compression(monkeypatch):
+    _patch_runtime(monkeypatch)
+    captured = {}
+    monkeypatch.setattr("run_agent.AIAgent", _fake_agent_class(captured))
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = adapter._create_agent(
+        session_id="s1", requested_provider="anthropic",
+        requested_model="claude-haiku-4-5-20251001", strict_model=True,
+    )
+    assert captured["skip_background_review"] is True
+    assert agent.compression_enabled is False
+    assert agent._aux_models_used == []
+
+
+def test_create_agent_non_strict_keeps_background_review_and_compression(monkeypatch):
+    _patch_runtime(monkeypatch)
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: dict(ANTHROPIC_RUNTIME))
+    captured = {}
+    monkeypatch.setattr("run_agent.AIAgent", _fake_agent_class(captured))
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = adapter._create_agent(session_id="s1")
+    assert "skip_background_review" not in captured
+    assert not hasattr(agent, "compression_enabled") or agent.compression_enabled is not False
+
+
+def test_create_agent_strict_rejects_an_agent_on_a_proxy_endpoint(monkeypatch):
+    from gateway.platforms.api_server import _StrictModelViolation
+
+    _patch_runtime(monkeypatch)
+    captured = {}
+
+    class ProxyAgent(_fake_agent_class(captured)):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.base_url = "https://litellm.internal/v1"
+
+    monkeypatch.setattr("run_agent.AIAgent", ProxyAgent)
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    with pytest.raises(_StrictModelViolation):
+        adapter._create_agent(
+            session_id="s1", requested_provider="anthropic",
+            requested_model="claude-haiku-4-5-20251001", strict_model=True,
+        )
+
+
+def test_auxiliary_call_is_refused_and_recorded_inside_a_strict_run():
+    from agent import auxiliary_client as aux
+
+    class A:
+        pass
+
+    agent = A()
+    token = aux.enter_strict_aux_scope(agent)
+    try:
+        with pytest.raises(aux.StrictAuxiliaryViolation):
+            aux.call_llm("compression", provider="openrouter", model="google/gemini-flash", messages=[])
+    finally:
+        aux.exit_strict_aux_scope(token)
+    assert agent._aux_models_used == [{"provider": "openrouter", "model": "google/gemini-flash"}]
+    assert "strict model run" in agent._strict_aux_violation
+    # Outside the scope the guard is inert.
+    aux._refuse_auxiliary_in_strict_run("compression", "openrouter", "x")
+
+
+def test_async_auxiliary_call_is_refused_inside_a_strict_run():
+    from agent import auxiliary_client as aux
+
+    class A:
+        pass
+
+    agent = A()
+
+    async def go():
+        token = aux.enter_strict_aux_scope(agent)
+        try:
+            await aux.async_call_llm("title", messages=[])
+        finally:
+            aux.exit_strict_aux_scope(token)
+
+    with pytest.raises(aux.StrictAuxiliaryViolation):
+        asyncio.run(go())
+    assert agent._aux_models_used == [{"provider": "auto", "model": "auto"}]
+
+
+@pytest.mark.asyncio
+async def test_strict_status_reports_aux_models_used(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: dict(ANTHROPIC_RUNTIME),
+    )
+    adapter = _make_adapter()
+    agent = _RanAgent("anthropic", "claude-haiku-4-5-20251001")
+    agent._strict_runtime = True
+    agent._aux_models_used = []
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            resp = await cli.post("/v1/runs", json=STRICT_BODY)
+            status = await _wait_terminal(cli, (await resp.json())["run_id"])
+    assert status["aux_models_used"] == []
+
+
+@pytest.mark.asyncio
+async def test_strict_run_thread_enters_the_auxiliary_guard(monkeypatch):
+    """The scope is active WHILE the agent runs, so any auxiliary call it makes is refused."""
+    from agent import auxiliary_client as aux
+
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: dict(ANTHROPIC_RUNTIME),
+    )
+    seen = {}
+    adapter = _make_adapter()
+    agent = _RanAgent("anthropic", "claude-haiku-4-5-20251001")
+    agent._strict_runtime = True
+    agent._aux_models_used = []
+
+    def run_conversation(**_kw):
+        seen["scope_agent"] = aux._STRICT_AUX_AGENT.get()
+        return {"final_response": "done"}
+
+    agent.run_conversation = run_conversation
+    async with TestClient(TestServer(_create_app(adapter))) as cli:
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            resp = await cli.post("/v1/runs", json=STRICT_BODY)
+            await _wait_terminal(cli, (await resp.json())["run_id"])
+    assert seen["scope_agent"] is agent
+    assert aux._STRICT_AUX_AGENT.get() is None

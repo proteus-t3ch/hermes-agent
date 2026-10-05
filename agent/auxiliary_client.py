@@ -3469,6 +3469,63 @@ def _relay_auxiliary_metadata(
     }
 
 
+
+# ── Strict model runs: no auxiliary model calls ─────────────────────────────
+#
+# A strict run (POST /v1/runs with ``strict_model: true``) promises that only
+# the pinned provider+model executes.  Auxiliary calls (context compression,
+# background review, titles, summaries, ...) have their own provider chain and
+# can fall through to other providers, so inside a strict run they are REFUSED
+# rather than re-routed: the API server enters this scope in the run's worker
+# thread, ``call_llm`` / ``async_call_llm`` check it first, and any attempt is
+# recorded on the agent (``_aux_models_used``) and raised.  The agent also has
+# compression and background review switched off, so in normal operation no
+# auxiliary call is even attempted; this guard is what makes that a guarantee.
+
+
+class StrictAuxiliaryViolation(RuntimeError):
+    """An auxiliary LLM call was attempted inside a strict model run."""
+
+
+_STRICT_AUX_AGENT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "strict_model_run_agent", default=None
+)
+
+
+def enter_strict_aux_scope(agent: Any) -> contextvars.Token:
+    """Mark the current context as a strict run owned by *agent*."""
+    if not isinstance(getattr(agent, "_aux_models_used", None), list):
+        agent._aux_models_used = []
+    return _STRICT_AUX_AGENT.set(agent)
+
+
+def exit_strict_aux_scope(token: Optional[contextvars.Token]) -> None:
+    if token is None:
+        return
+    try:
+        _STRICT_AUX_AGENT.reset(token)
+    except (RuntimeError, ValueError):
+        pass
+
+
+def _refuse_auxiliary_in_strict_run(task: Optional[str], provider: Optional[str], model: Optional[str]) -> None:
+    agent = _STRICT_AUX_AGENT.get()
+    if agent is None:
+        return
+    attempted = {"provider": str(provider or "auto"), "model": str(model or "auto")}
+    try:
+        used = getattr(agent, "_aux_models_used", None)
+        if isinstance(used, list):
+            used.append(attempted)
+        agent._strict_aux_violation = f"auxiliary call ({task or 'unspecified'}) attempted in a strict model run"
+    except Exception:
+        pass
+    logger.warning("Strict model run: refused auxiliary call task=%s", task or "-")
+    raise StrictAuxiliaryViolation(
+        f"auxiliary LLM call ({task or 'unspecified'}) refused: strict model runs make no auxiliary model calls"
+    )
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -9616,6 +9673,7 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    _refuse_auxiliary_in_strict_run(task, provider, model)
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -10562,6 +10620,7 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    _refuse_auxiliary_in_strict_run(task, provider, model)
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
