@@ -20,6 +20,7 @@ same ``custom > ai > fallback`` precedence in its session importer.
 import json
 import logging
 import re
+import contextvars
 import threading
 from typing import Any, Callable, Optional
 
@@ -747,9 +748,13 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    # Copied at submission and run with ctx.run: the title thread sees the caller's
+    # ContextVars (a strict run's auxiliary guard among them) and nothing stale —
+    # each start copies afresh, so no run's context outlives it or leaks into another.
+    ctx = contextvars.copy_context()
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message),
+        target=ctx.run,
+        args=(auto_title_session, session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

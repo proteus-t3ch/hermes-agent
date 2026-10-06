@@ -1379,6 +1379,9 @@ class AIAgent:
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
+            # Run-local strict marker: auxiliary calls handed this runtime are refused
+            # even across a thread boundary that dropped the strict ContextVar.
+            **({"strict_model_run": True} if getattr(self, "_strict_runtime", False) is True else {}),
         }
 
     def _check_compression_model_feasibility(self) -> None:

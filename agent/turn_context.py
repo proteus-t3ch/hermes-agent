@@ -251,6 +251,10 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
 
     if str(getattr(agent, "platform", "") or "").lower() in _UNTITLED_PLATFORMS:
         return
+    # Strict model runs make no auxiliary model calls: titling one would send the
+    # run's input to the auxiliary title model, outside the pinned contract.
+    if getattr(agent, "_strict_runtime", False) is True:
+        return
 
     try:
         from agent.message_content import flatten_message_text
@@ -298,6 +302,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 "base_url": getattr(agent, "base_url", None),
                 "api_key": getattr(agent, "api_key", None),
                 "api_mode": getattr(agent, "api_mode", None),
+                **({"strict_model_run": True} if getattr(agent, "_strict_runtime", False) is True else {}),
             },
             title_callback=getattr(agent, "_on_session_title", None),
             runtime_validator=lambda: (

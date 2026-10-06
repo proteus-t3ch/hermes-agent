@@ -3508,9 +3508,20 @@ def exit_strict_aux_scope(token: Optional[contextvars.Token]) -> None:
         pass
 
 
-def _refuse_auxiliary_in_strict_run(task: Optional[str], provider: Optional[str], model: Optional[str]) -> None:
+def _refuse_auxiliary_in_strict_run(
+    task: Optional[str], provider: Optional[str], model: Optional[str],
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> None:
     agent = _STRICT_AUX_AGENT.get()
     if agent is None:
+        # Second leg, independent of ContextVar inheritance: a strict agent marks
+        # its OWN runtime dict (run-local, never global).  A caller that crossed a
+        # plain thread boundary still carries that dict, and is refused.
+        if isinstance(main_runtime, dict) and main_runtime.get("strict_model_run") is True:
+            logger.warning("Strict model run: refused auxiliary call task=%s (strict main_runtime)", task or "-")
+            raise StrictAuxiliaryViolation(
+                f"auxiliary LLM call ({task or 'unspecified'}) refused: strict model runs make no auxiliary model calls"
+            )
         return
     attempted = {"provider": str(provider or "auto"), "model": str(model or "auto")}
     try:
@@ -9673,7 +9684,7 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    _refuse_auxiliary_in_strict_run(task, provider, model)
+    _refuse_auxiliary_in_strict_run(task, provider, model, main_runtime)
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -10620,7 +10631,7 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
-    _refuse_auxiliary_in_strict_run(task, provider, model)
+    _refuse_auxiliary_in_strict_run(task, provider, model, main_runtime)
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
